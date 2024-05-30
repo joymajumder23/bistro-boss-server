@@ -2,7 +2,8 @@ const express = require('express');
 const app = express();
 const cors = require('cors');
 var jwt = require('jsonwebtoken');
-require('dotenv').config()
+require('dotenv').config();
+const stripe = require("stripe")(process.env.STRIPE_SCRETE_KEY);
 const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
 const port = process.env.PORT || 5000;
 
@@ -31,6 +32,7 @@ async function run() {
     const menuCollection = client.db("bistroDB").collection("menu");
     const cartCollection = client.db("bistroDB").collection("carts");
     const userCollection = client.db("bistroDB").collection("users");
+    const paymentCollection = client.db("bistroDB").collection("payments");
 
     // jwt related api
     app.post('/jwt', async (req, res) => {
@@ -181,6 +183,114 @@ async function run() {
       const id = req.params.id;
       const query = { _id: id } || { _id: new ObjectId(id) };
       const result = await menuCollection.deleteOne(query);
+      res.send(result);
+    })
+
+    // payment intent
+    app.post('/create-payment-intent', async (req, res) => {
+      const { price } = req.body;
+      const amount = parseInt(price * 100);
+      const paymentIntent = await stripe.paymentIntents.create({
+        amount: amount,
+        currency: 'usd',
+        payment_method_types: ['card']
+      });
+      res.send({
+        clientSecret: paymentIntent.client_secret
+      });
+    })
+
+    // payment history data loaded by user email
+    app.get('/payments/:email', async (req, res) => {
+      const query = { email: req.params.email };
+      // if(query !== req.decoded.email){
+      //   return res.status(403).send({message: 'forbidden access'});
+      // }
+      const result = await paymentCollection.find(query).toArray();
+      res.send(result);
+      console.log(result);
+    })
+
+    // payment api
+    app.get('/payments', async (req, res) => {
+      const result = await paymentCollection.find().toArray();
+      res.send(result);
+    })
+
+    app.post('/payments', async (req, res) => {
+      const payment = req.body;
+      const result = await paymentCollection.insertOne(payment);
+
+      // carefully delete each item from the cart
+      const query = {
+        _id: {
+          $in: payment.cartId.map(id => new ObjectId(id))
+        }
+      };
+      const deleted = await cartCollection.deleteMany(query);
+      res.send(result, deleted);
+    })
+
+    // stats or analytics
+    app.get('/admin-stats', async (req, res) => {
+      const users = await userCollection.estimatedDocumentCount();
+      const menuItem = await menuCollection.estimatedDocumentCount();
+      const order = await paymentCollection.estimatedDocumentCount();
+
+      // this is not the best way
+      // const payments = await paymentCollection.find().toArray();
+      // const revenue = payments.reduce((total, payment) => total + payment.price, 0);
+
+      // this is best way
+      const result = await paymentCollection.aggregate([{
+        $group: {
+          _id: null,
+          totalRevenue: {
+            $sum: '$price'
+          }
+        }
+      }]).toArray();
+
+      const revenue = result.length > 0 ? result[0].totalRevenue : 0;
+
+      res.send({
+        users, menuItem, revenue, order
+      })
+    })
+
+    // aggregate
+    app.get('/order-stats', async (req, res) => {
+      const result = await paymentCollection.aggregate([
+        {
+          $unwind: '$menuItemCart'
+        },
+        {
+          $lookup: {
+            from: 'menu',
+            localField: 'menuItemCart',
+            foreignField: '_id',
+            as: 'menuItems'
+          }
+        },
+        {
+          $unwind: '$menuItems'
+        },
+        {
+          $group: {
+            _id: '$menuItems.category',
+            quantity: { $sum: 1 },
+            revenue: { $sum: '$menuItems.price' }
+          }
+        },
+        {
+          $project: {
+            _id: 0,
+            category: '$_id',
+            quantity: '$quantity',
+            revenue: '$revenue'
+          }
+        }
+      ]).toArray();
       res.send(result);
     })
 
